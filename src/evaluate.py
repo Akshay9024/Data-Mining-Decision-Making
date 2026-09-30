@@ -29,18 +29,40 @@ from src.tune import build_estimator
 logger = logging.getLogger(__name__)
 
 
-def youden_threshold(
+def train_oof_proba(
     X: np.ndarray, y: np.ndarray, params: dict[str, Any], n_estimators: int, config: dict[str, Any]
-) -> float:
-    """Threshold maximizing Youden's J on out-of-fold train predictions. No test contact."""
+) -> np.ndarray:
+    """Out-of-fold predicted probabilities on the train partition. All thresholds derive from these."""
     skf = StratifiedKFold(n_splits=config["cv"]["n_splits"], shuffle=True, random_state=config["seed"])
     oof = np.zeros(len(y))
     for tr, va in skf.split(X, y):
         model = build_estimator(params, n_estimators, config, None)
         model.fit(X[tr], y[tr], verbose=False)
         oof[va] = model.predict_proba(X[va])[:, 1]
+    return oof
+
+
+def youden_threshold(oof: np.ndarray, y: np.ndarray) -> float:
     fpr, tpr, thr = roc_curve(y, oof)
     return float(thr[int(np.argmax(tpr - fpr))])
+
+
+def _class_rates(y: np.ndarray, yhat: np.ndarray) -> tuple[float, float]:
+    tn, fp, fn, tp = confusion_matrix(y, yhat, labels=[0, 1]).ravel()
+    fn_rate = fn / (fn + tp) if (fn + tp) else 0.0   # miss rate
+    fp_rate = fp / (fp + tn) if (fp + tn) else 0.0   # fall-out
+    return fn_rate, fp_rate
+
+
+def cost_threshold(oof: np.ndarray, y: np.ndarray, cost_ratio: float, grid: np.ndarray) -> float:
+    """Minimize c_FN*FN_rate + c_FP*FP_rate with c_FP=1, c_FN=cost_ratio (per-class rates)."""
+    best_t, best_c = float(grid[0]), np.inf
+    for t in grid:
+        fn_rate, fp_rate = _class_rates(y, (oof >= t).astype(int))
+        cost = cost_ratio * fn_rate + fp_rate
+        if cost < best_c:  # ascending grid -> ties resolve to the more recall-favorable (lower) t
+            best_c, best_t = cost, float(t)
+    return best_t
 
 
 def fit_final(
@@ -71,29 +93,57 @@ def loss_trajectory(
     plt.close(fig)
 
 
-def evaluate_test(
-    model: XGBClassifier, X_test: np.ndarray, y_test: np.ndarray, threshold: float
-) -> tuple[dict[str, Any], np.ndarray]:
-    proba = model.predict_proba(X_test)[:, 1]
+def operating_metrics(y: np.ndarray, proba: np.ndarray, threshold: float) -> dict[str, Any]:
     yhat = (proba >= threshold).astype(int)
-    yhat05 = (proba >= 0.5).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_test, yhat).ravel()
-    metrics = {
+    tn, fp, fn, tp = confusion_matrix(y, yhat, labels=[0, 1]).ravel()
+    return {
         "threshold": float(threshold),
-        "accuracy": float(accuracy_score(y_test, yhat)),
-        "precision_M": float(precision_score(y_test, yhat)),
-        "recall_M": float(recall_score(y_test, yhat)),
-        "specificity": float(tn / (tn + fp)),
-        "f1_M": float(f1_score(y_test, yhat)),
-        "roc_auc": float(roc_auc_score(y_test, proba)),
-        "pr_auc": float(average_precision_score(y_test, proba)),
-        "mcc": float(matthews_corrcoef(y_test, yhat)),
-        "brier": float(brier_score_loss(y_test, proba)),
+        "accuracy": float(accuracy_score(y, yhat)),
+        "recall_M": float(recall_score(y, yhat, zero_division=0)),
+        "precision_M": float(precision_score(y, yhat, zero_division=0)),
+        "specificity": float(tn / (tn + fp)) if (tn + fp) else 0.0,
+        "f1_M": float(f1_score(y, yhat, zero_division=0)),
+        "mcc": float(matthews_corrcoef(y, yhat)),
         "confusion_matrix": {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)},
-        "accuracy_at_0.5": float(accuracy_score(y_test, yhat05)),
-        "recall_M_at_0.5": float(recall_score(y_test, yhat05)),
     }
-    return metrics, proba
+
+
+def _pctile(a: np.ndarray) -> list[float]:
+    return [float(np.percentile(a, 2.5)), float(np.percentile(a, 97.5))]
+
+
+def bootstrap_ci(
+    y: np.ndarray, proba: np.ndarray, thresholds: dict[str, float], n: int, seed: int
+) -> dict[str, Any]:
+    """Percentile bootstrap 95% CIs. Threshold-free (AUCs) + per-operating-point metrics."""
+    rng = np.random.default_rng(seed)
+    N = len(y)
+    auc: list[float] = []
+    prauc: list[float] = []
+    per = {name: {"accuracy": [], "recall_M": [], "precision_M": [], "f1_M": [], "specificity": []}
+           for name in thresholds}
+    for _ in range(n):
+        idx = rng.integers(0, N, N)
+        yb, pb = y[idx], proba[idx]
+        if np.unique(yb).size < 2:
+            continue
+        auc.append(roc_auc_score(yb, pb))
+        prauc.append(average_precision_score(yb, pb))
+        for name, t in thresholds.items():
+            tn, fp, fn, tp = confusion_matrix(yb, (pb >= t).astype(int), labels=[0, 1]).ravel()
+            per[name]["accuracy"].append((tp + tn) / yb.size)
+            per[name]["recall_M"].append(tp / (tp + fn) if (tp + fn) else 0.0)
+            per[name]["precision_M"].append(tp / (tp + fp) if (tp + fp) else 0.0)
+            per[name]["f1_M"].append(2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0)
+            per[name]["specificity"].append(tn / (tn + fp) if (tn + fp) else 0.0)
+    out: dict[str, Any] = {
+        "n_resamples": n,
+        "roc_auc": _pctile(np.asarray(auc)),
+        "pr_auc": _pctile(np.asarray(prauc)),
+        "operating_points": {name: {k: _pctile(np.asarray(v)) for k, v in per[name].items()}
+                             for name in thresholds},
+    }
+    return out
 
 
 def _plot_roc(y: np.ndarray, proba: np.ndarray, fig_dir: str) -> None:
@@ -123,7 +173,7 @@ def _plot_pr(y: np.ndarray, proba: np.ndarray, fig_dir: str) -> None:
     plt.close(fig)
 
 
-def _plot_confusion(cm: dict[str, int], fig_dir: str) -> None:
+def _plot_confusion(cm: dict[str, int], name: str, threshold: float, fig_dir: str) -> None:
     mat = np.array([[cm["tn"], cm["fp"]], [cm["fn"], cm["tp"]]])
     fig, ax = plt.subplots(figsize=(4, 4))
     ax.imshow(mat, cmap="Blues")
@@ -134,9 +184,9 @@ def _plot_confusion(cm: dict[str, int], fig_dir: str) -> None:
     for i in range(2):
         for j in range(2):
             ax.text(j, i, mat[i, j], ha="center", va="center")
-    ax.set_title("Confusion matrix (Youden threshold)")
+    ax.set_title(f"Confusion: {name} (t={threshold:.3f})")
     fig.tight_layout()
-    fig.savefig(os.path.join(fig_dir, "confusion_matrix.png"), dpi=150)
+    fig.savefig(os.path.join(fig_dir, f"confusion_matrix_{name}.png"), dpi=150)
     plt.close(fig)
 
 
@@ -173,19 +223,86 @@ def shap_artifacts(model: XGBClassifier, X_train: np.ndarray, fig_dir: str) -> l
     return [FEATURE_NAMES[i] for i in top_idx]
 
 
+def fn_error_analysis(
+    model: XGBClassifier, X_train: np.ndarray, y_train: np.ndarray,
+    X_test: np.ndarray, y_test: np.ndarray, proba: np.ndarray, threshold: float,
+    fig_dir: str, results_dir: str,
+) -> list[int]:
+    """Per-case analysis of malignant cases missed at `threshold` (native TreeSHAP breakdown)."""
+    yhat = (proba >= threshold).astype(int)
+    fn_idx = np.where((y_test == 1) & (yhat == 0))[0]
+    if fn_idx.size == 0:
+        logger.info("no false negatives at threshold %.4f", threshold)
+        with open(os.path.join(results_dir, "fn_analysis.json"), "w") as fh:
+            json.dump({"threshold": float(threshold), "n_false_negatives": 0, "cases": []}, fh, indent=2)
+        return []
+    contribs = model.get_booster().predict(xgb.DMatrix(X_test[fn_idx]), pred_contribs=True)
+    base = float(contribs[0, -1])
+    sv = contribs[:, :-1]
+    cases: list[dict[str, Any]] = []
+    for j, i in enumerate(fn_idx):
+        order = np.argsort(np.abs(sv[j]))[::-1]
+        top = order[:12]
+        vals = sv[j][top]
+        names = [FEATURE_NAMES[k] for k in top]
+        colors = ["#c44e52" if v > 0 else "#4c72b0" for v in vals]
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.barh(np.arange(len(top))[::-1], vals, color=colors)
+        ax.set_yticks(np.arange(len(top))[::-1])
+        ax.set_yticklabels(names, fontsize=8)
+        ax.axvline(0, color="k", lw=0.8)
+        ax.set_xlabel("SHAP contribution (log-odds)  |  blue pushes benign, red pushes malignant")
+        ax.set_title(f"FN test#{i}  p(M)={proba[i]:.3f}  (base margin {base:.2f})")
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, f"fn_case_{i}_contrib.png"), dpi=150)
+        plt.close(fig)
+
+        top5 = order[:5]
+        fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+        feat_records: dict[str, Any] = {}
+        for ax, k in zip(axes, top5):
+            feat = FEATURE_NAMES[k]
+            val = float(X_test[i, k])
+            ax.hist(X_train[y_train == 0, k], bins=25, alpha=0.6, color="#4c72b0", label="B (train)")
+            ax.hist(X_train[y_train == 1, k], bins=25, alpha=0.6, color="#c44e52", label="M (train)")
+            ax.axvline(val, color="k", lw=2, label="FN value")
+            ax.set_title(feat, fontsize=9)
+            ax.tick_params(labelsize=6)
+            feat_records[feat] = {
+                "value": val,
+                "shap": float(sv[j][k]),
+                "pctile_in_benign_train": float((X_train[y_train == 0, k] <= val).mean() * 100),
+                "pctile_in_malignant_train": float((X_train[y_train == 1, k] <= val).mean() * 100),
+            }
+        axes[0].legend(fontsize=7)
+        fig.suptitle(f"FN test#{i}: top-5 SHAP features vs train class distributions")
+        fig.tight_layout()
+        fig.savefig(os.path.join(fig_dir, f"fn_case_{i}_features.png"), dpi=120)
+        plt.close(fig)
+
+        cases.append({"test_index": int(i), "proba_M": float(proba[i]),
+                      "base_margin": base, "top_features": feat_records})
+    with open(os.path.join(results_dir, "fn_analysis.json"), "w") as fh:
+        json.dump({"threshold": float(threshold), "n_false_negatives": int(fn_idx.size), "cases": cases},
+                  fh, indent=2)
+    return fn_idx.tolist()
+
+
 def write_comparison(metrics: dict[str, Any], config: dict[str, Any]) -> None:
+    op = metrics["operating_points"]["youden"]
     path = os.path.join(config["paths"]["results_dir"], "comparison_table.csv")
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["model", "test_accuracy", "roc_auc", "pr_auc", "recall_M", "precision_M", "f1_M", "mcc"])
-        w.writerow(["XGBoost", metrics["accuracy"], metrics["roc_auc"], metrics["pr_auc"],
-                    metrics["recall_M"], metrics["precision_M"], metrics["f1_M"], metrics["mcc"]])
+        w.writerow(["XGBoost", op["accuracy"], metrics["roc_auc"], metrics["pr_auc"],
+                    op["recall_M"], op["precision_M"], op["f1_M"], op["mcc"]])
     logger.info("comparison table with XGBoost row at %s (append baseline rows externally)", path)
 
 
 def run_evaluation(config: dict[str, Any]) -> None:
     set_seed(config["seed"])
     fig_dir = config["paths"]["figures_dir"]
+    results_dir = config["paths"]["results_dir"]
     os.makedirs(fig_dir, exist_ok=True)
     with open(config["paths"]["best_params_file"]) as fh:
         record = json.load(fh)
@@ -195,27 +312,47 @@ def run_evaluation(config: dict[str, Any]) -> None:
     X_train_df, X_test_df, y_train, y_test = load_split(config)
     X_train, X_test = X_train_df.to_numpy(), X_test_df.to_numpy()
 
-    threshold = youden_threshold(X_train, y_train, params, n_estimators, config)
-    logger.info("Youden threshold = %.4f", threshold)
+    # All thresholds are chosen on train out-of-fold probabilities, then frozen.
+    oof = train_oof_proba(X_train, y_train, params, n_estimators, config)
+    tcfg = config["threshold"]
+    grid = np.arange(tcfg["grid_lo"], tcfg["grid_hi"] + tcfg["grid_step"] / 2, tcfg["grid_step"])
+    thresholds: dict[str, float] = {"default_0.5": 0.5, "youden": youden_threshold(oof, y_train)}
+    for r in tcfg["cost_ratios"]:
+        thresholds[f"cost_{r}"] = cost_threshold(oof, y_train, float(r), grid)
+    logger.info("operating thresholds: %s", {k: round(v, 4) for k, v in thresholds.items()})
 
     model = fit_final(X_train, y_train, params, n_estimators, config)
     model.save_model(config["paths"]["model_file"])
     loss_trajectory(X_train, y_train, params, n_estimators, config,
                     os.path.join(fig_dir, "loss_trajectory.png"))
 
-    metrics, proba = evaluate_test(model, X_test, y_test, threshold)  # ONE-TOUCH test eval
+    proba = model.predict_proba(X_test)[:, 1]  # ONE-TOUCH test eval
+    operating_points = {name: operating_metrics(y_test, proba, t) for name, t in thresholds.items()}
+    metrics: dict[str, Any] = {
+        "roc_auc": float(roc_auc_score(y_test, proba)),
+        "pr_auc": float(average_precision_score(y_test, proba)),
+        "brier": float(brier_score_loss(y_test, proba)),
+        "thresholds": {k: float(v) for k, v in thresholds.items()},
+        "operating_points": operating_points,
+        "bootstrap_ci": bootstrap_ci(y_test, proba, thresholds, config["bootstrap"]["n_test"], config["seed"]),
+    }
     with open(config["paths"]["metrics_file"], "w") as fh:
         json.dump(metrics, fh, indent=2)
 
     _plot_roc(y_test, proba, fig_dir)
     _plot_pr(y_test, proba, fig_dir)
-    _plot_confusion(metrics["confusion_matrix"], fig_dir)
     _plot_calibration(y_test, proba, fig_dir)
+    for name, op in operating_points.items():
+        _plot_confusion(op["confusion_matrix"], name, thresholds[name], fig_dir)
     top = shap_artifacts(model, X_train, fig_dir)
+    fn = fn_error_analysis(model, X_train, y_train, X_test, y_test, proba,
+                           thresholds["youden"], fig_dir, results_dir)
     write_comparison(metrics, config)
 
-    logger.info("test metrics: %s", json.dumps(metrics))
-    logger.info("SHAP top-5 features: %s", top)
+    logger.info("test roc_auc=%.4f pr_auc=%.4f", metrics["roc_auc"], metrics["pr_auc"])
+    logger.info("operating points: %s", {k: {"acc": round(v["accuracy"], 4), "recall": round(v["recall_M"], 4),
+                                             "fn": v["confusion_matrix"]["fn"]} for k, v in operating_points.items()})
+    logger.info("SHAP top-5: %s | false negatives (youden): %s", top, fn)
 
 
 def main() -> None:

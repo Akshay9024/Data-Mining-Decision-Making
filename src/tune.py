@@ -162,14 +162,57 @@ def run_stage_b(
     return study
 
 
-def _plot_curve(grid: list[float], mean: list[float], std: list[float], axis: str, path: str, logx: bool) -> None:
+def cv_oof_proba(
+    params: dict[str, Any], X: np.ndarray, y: np.ndarray, config: dict[str, Any],
+    n_estimators: int, early_stopping_rounds: int | None,
+) -> tuple[np.ndarray, list[float]]:
+    """One CV pass returning out-of-fold probabilities and per-fold ROC-AUCs."""
+    skf = StratifiedKFold(n_splits=config["cv"]["n_splits"], shuffle=True, random_state=config["seed"])
+    oof = np.zeros(len(y))
+    fold_aucs: list[float] = []
+    for tr, va in skf.split(X, y):
+        model = build_estimator(params, n_estimators, config, early_stopping_rounds)
+        if early_stopping_rounds:
+            model.fit(X[tr], y[tr], eval_set=[(X[va], y[va])], verbose=False)
+            best = int(model.best_iteration)
+            proba = model.predict_proba(X[va], iteration_range=(0, best + 1))[:, 1]
+        else:
+            model.fit(X[tr], y[tr], verbose=False)
+            proba = model.predict_proba(X[va])[:, 1]
+        oof[va] = proba
+        fold_aucs.append(roc_auc_score(y[va], proba))
+    return oof, fold_aucs
+
+
+def _bootstrap_auc_ci(y: np.ndarray, oof: np.ndarray, n: int, seed: int) -> tuple[float, float, float]:
+    """Bootstrap 95% CI of OOF ROC-AUC by resampling data points (sound; not fold-resampling)."""
+    rng = np.random.default_rng(seed)
+    N = len(y)
+    vals: list[float] = []
+    for _ in range(n):
+        idx = rng.integers(0, N, N)
+        if np.unique(y[idx]).size < 2:
+            continue
+        vals.append(roc_auc_score(y[idx], oof[idx]))
+    arr = np.asarray(vals)
+    return float(roc_auc_score(y, oof)), float(np.percentile(arr, 2.5)), float(np.percentile(arr, 97.5))
+
+
+def _plot_curve(
+    grid: list[float], oof_auc: list[float], ci_lo: list[float], ci_hi: list[float],
+    fold_mean: list[float], fold_std: list[float], axis: str, path: str, logx: bool,
+) -> None:
     fig, ax = plt.subplots(figsize=(6, 4))
-    ax.errorbar(grid, mean, yerr=std, marker="o", capsize=3)
+    ax.fill_between(grid, ci_lo, ci_hi, color="#c44e52", alpha=0.2, label="95% bootstrap CI (OOF)")
+    ax.plot(grid, oof_auc, marker="o", color="#c44e52", label="OOF ROC-AUC")
+    ax.errorbar(grid, fold_mean, yerr=fold_std, fmt="s", color="#4c72b0", alpha=0.55,
+                capsize=3, markersize=4, label="fold mean ± std")
     if logx:
         ax.set_xscale("log")
     ax.set_xlabel(axis)
-    ax.set_ylabel("CV ROC-AUC (mean ± std)")
+    ax.set_ylabel("ROC-AUC")
     ax.set_title(f"Sensitivity: {axis}")
+    ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
@@ -183,25 +226,44 @@ def sensitivity_curves(
     os.makedirs(fig_dir, exist_ok=True)
     max_n = config["tuning"]["max_n_estimators"]
     esr = config["tuning"]["early_stopping_rounds"]
+    n_boot = config["bootstrap"]["n_sensitivity"]
     out: dict[str, Any] = {}
     for axis in ("max_depth", "learning_rate", "n_estimators"):
-        means: list[float] = []
-        stds: list[float] = []
+        oof_auc: list[float] = []
+        ci_lo: list[float] = []
+        ci_hi: list[float] = []
+        fold_mean: list[float] = []
+        fold_std: list[float] = []
         for v in grids[axis]:
             params = dict(best_params)
             if axis == "n_estimators":
-                res = cv_evaluate(params, X, y, config, int(v), None)  # fixed rounds, no early stopping
+                oof, aucs = cv_oof_proba(params, X, y, config, int(v), None)  # fixed rounds
             else:
                 params[axis] = v
-                res = cv_evaluate(params, X, y, config, max_n, esr)
-            means.append(res["roc_auc_mean"])
-            stds.append(res["roc_auc_std"])
-        out[axis] = {"grid": grids[axis], "mean": means, "std": stds}
-        _plot_curve(grids[axis], means, stds, axis, os.path.join(fig_dir, f"sensitivity_{axis}.png"),
+                oof, aucs = cv_oof_proba(params, X, y, config, max_n, esr)
+            a, lo, hi = _bootstrap_auc_ci(y, oof, n_boot, config["seed"])
+            oof_auc.append(a)
+            ci_lo.append(lo)
+            ci_hi.append(hi)
+            fold_mean.append(float(np.mean(aucs)))
+            fold_std.append(float(np.std(aucs)))
+        out[axis] = {"grid": grids[axis], "oof_auc": oof_auc, "ci_lo": ci_lo, "ci_hi": ci_hi,
+                     "fold_mean": fold_mean, "fold_std": fold_std}
+        _plot_curve(grids[axis], oof_auc, ci_lo, ci_hi, fold_mean, fold_std, axis,
+                    os.path.join(fig_dir, f"sensitivity_{axis}.png"),
                     logx=axis in ("learning_rate", "n_estimators"))
         logger.info("sensitivity %s done", axis)
     with open(os.path.join(config["paths"]["results_dir"], "sensitivity.json"), "w") as fh:
         json.dump(out, fh, indent=2)
+
+
+def run_sensitivity(config: dict[str, Any]) -> None:
+    """Regenerate sensitivity curves from the saved best config (no Stage A/B re-run)."""
+    set_seed(config["seed"])
+    with open(config["paths"]["best_params_file"]) as fh:
+        best_params = json.load(fh)["params"]
+    X_train, _, y_train, _ = load_split(config)
+    sensitivity_curves(X_train.to_numpy(), y_train, config, best_params)
 
 
 def run_tuning(config: dict[str, Any]) -> None:

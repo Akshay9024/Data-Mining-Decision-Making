@@ -5,13 +5,13 @@ import logging
 
 from src.data import load_config, load_split, run_eda, set_seed
 from src.evaluate import run_evaluation
-from src.tune import run_tuning
+from src.tune import run_sensitivity, run_tuning
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(description="WDBC XGBoost pipeline")
-    ap.add_argument("--stage", choices=["data", "tune", "evaluate", "all"], default="all")
+    ap.add_argument("--stage", choices=["data", "tune", "sensitivity", "evaluate", "all"], default="all")
     ap.add_argument("--config", default="configs/config.json")
     args = ap.parse_args()
 
@@ -23,6 +23,8 @@ def main() -> None:
         run_eda(config)
     if args.stage in ("tune", "all"):
         run_tuning(config)
+    if args.stage == "sensitivity":  # standalone regen from saved best config
+        run_sensitivity(config)
     if args.stage in ("evaluate", "all"):  # test set touched exactly once, always last
         run_evaluation(config)
 
