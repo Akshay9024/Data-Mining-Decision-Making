@@ -1,0 +1,49 @@
+{
+  "seed": 42,
+  "device": "cpu",
+  "n_jobs": -1,
+  "paths": {
+    "data_file": "data/wdbc.data",
+    "results_dir": "results",
+    "figures_dir": "results/figures",
+    "model_file": "results/final_model.json",
+    "best_params_file": "results/best_params.json",
+    "metrics_file": "results/test_metrics.json",
+    "study_db": "results/optuna_study.db",
+    "study_name": "wdbc_xgb"
+  },
+  "data": {
+    "download_url": "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data",
+    "n_features": 30,
+    "test_size": 0.2
+  },
+  "cv": {
+    "n_splits": 5
+  },
+  "tuning": {
+    "objective_metric": "roc_auc",
+    "max_n_estimators": 1000,
+    "early_stopping_rounds": 50,
+    "stage_a": {
+      "n_iter": 60,
+      "space": {
+        "max_depth": [3, 10],
+        "min_child_weight": [1, 10],
+        "gamma": [0.0, 5.0],
+        "learning_rate": [0.01, 0.30],
+        "subsample": [0.5, 1.0],
+        "colsample_bytree": [0.5, 1.0],
+        "reg_alpha": [1e-4, 10.0],
+        "reg_lambda": [1e-4, 10.0]
+      }
+    },
+    "stage_b": {
+      "n_trials": 100
+    }
+  },
+  "sensitivity": {
+    "max_depth": [2, 3, 4, 5, 6, 7, 8, 10, 12],
+    "learning_rate": [0.01, 0.03, 0.05, 0.1, 0.2, 0.3],
+    "n_estimators": [50, 100, 200, 400, 800, 1600]
+  }
+}

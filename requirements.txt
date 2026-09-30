@@ -1,0 +1,14 @@
+# Core stack — pinned to the exact versions verified present in the `dmdm` env.
+numpy==2.2.6
+scipy==1.13.1
+pandas==2.3.3
+scikit-learn==1.5.2
+xgboost==3.2.0
+matplotlib==3.10.8
+joblib==1.4.2
+
+# Required by the spec but not yet installed. Versions below are best-effort
+# picks compatible with the pinned core; the numpy pin above prevents a silent
+# downgrade. Finalize to resolved versions via `pip freeze` after first install.
+optuna==4.1.0
+shap==0.46.0
