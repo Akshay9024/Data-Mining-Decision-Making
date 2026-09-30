@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+graphify-out
+data/
+results/
+.DS_Store
+CLAUDE.md
+Technical_Report.md
+*.log
+presentation.tex
