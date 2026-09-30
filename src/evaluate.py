@@ -20,6 +20,7 @@ from sklearn.metrics import (
     recall_score, roc_auc_score, roc_curve,
 )
 from sklearn.model_selection import StratifiedKFold, train_test_split
+import xgboost as xgb
 from xgboost import XGBClassifier
 
 from src.data import FEATURE_NAMES, load_config, load_split, set_seed
@@ -154,8 +155,10 @@ def _plot_calibration(y: np.ndarray, proba: np.ndarray, fig_dir: str) -> None:
 
 
 def shap_artifacts(model: XGBClassifier, X_train: np.ndarray, fig_dir: str) -> list[str]:
-    explainer = shap.TreeExplainer(model)
-    sv = explainer.shap_values(X_train)  # numpy in, avoids feature-name mismatch
+    # Native XGBoost TreeSHAP (margin space); avoids shap 0.46 <-> xgboost 3.x
+    # base_score parsing incompatibility. Last column is the bias term, dropped.
+    contribs = model.get_booster().predict(xgb.DMatrix(X_train), pred_contribs=True)
+    sv = contribs[:, :-1]
     plt.figure()
     shap.summary_plot(sv, X_train, feature_names=FEATURE_NAMES, show=False)
     plt.savefig(os.path.join(fig_dir, "shap_summary.png"), dpi=150, bbox_inches="tight")

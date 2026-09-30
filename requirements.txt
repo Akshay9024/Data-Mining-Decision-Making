@@ -12,3 +12,6 @@ joblib==1.4.2
 # downgrade. Finalize to resolved versions via `pip freeze` after first install.
 optuna==4.1.0
 shap==0.46.0
+# Mako is an alembic->optuna transitive dep the shared env failed to auto-install
+# (needed for optuna's SQLite study persistence). Pin version after first install.
+Mako
